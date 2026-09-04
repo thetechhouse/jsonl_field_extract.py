@@ -3,7 +3,8 @@
 
 JSONL uses ripgrep as an optional high-speed prefilter. Conventional JSON is
 parsed record-by-record with ijson, so top-level arrays need not fit in memory.
-All matching records are combined into one JSONL output file.
+By default, every discovered field path containing ``email`` (case-insensitive)
+is searched. All matching records are combined into one JSONL output file.
 """
 
 from __future__ import annotations
@@ -83,7 +84,18 @@ def parse_args() -> argparse.Namespace:
         "--field",
         action="append",
         dest="fields",
-        help="Field path, e.g. sender.email or recipients[].email; repeatable",
+        help=(
+            "Explicit field path, e.g. sender.email or recipients[].email; "
+            "repeatable. Overrides automatic email-field selection."
+        ),
+    )
+    parser.add_argument(
+        "--field-name-contains",
+        default="email",
+        help=(
+            "Automatically select discovered field paths containing this text, "
+            "case-insensitively (default: email)"
+        ),
     )
     parser.add_argument(
         "-t", "--term", action="append", dest="terms", help="Partial value; repeatable"
@@ -440,31 +452,14 @@ def discover_fields(
     return fields, valid, invalid
 
 
-def choose_fields(fields: dict[PathTokens, FieldInfo]) -> list[PathTokens]:
-    ordered = sorted(fields, key=lambda item: display_path(item).casefold())
-    if not ordered:
-        raise RuntimeError("No scalar fields were discovered in valid JSON records.")
-    print("\nDiscovered fields:")
-    width = len(str(len(ordered)))
-    for number, path in enumerate(ordered, 1):
-        info = fields[path]
-        examples = " | ".join(info.examples)
-        print(f"  {number:>{width}}. {display_path(path)}  [{info.occurrences}]  {examples}")
-    while True:
-        answer = input("\nSelect field number(s), comma-separated: ").strip()
-        try:
-            selected = []
-            for item in answer.split(","):
-                index = int(item.strip())
-                if not 1 <= index <= len(ordered):
-                    raise ValueError
-                if ordered[index - 1] not in selected:
-                    selected.append(ordered[index - 1])
-            if selected:
-                return selected
-        except ValueError:
-            pass
-        print("Enter one or more valid numbers, for example: 3,7")
+def select_fields_by_name(
+    fields: dict[PathTokens, FieldInfo], name_fragment: str
+) -> list[PathTokens]:
+    needle = name_fragment.casefold()
+    return sorted(
+        (path for path in fields if needle in display_path(path).casefold()),
+        key=lambda item: display_path(item).casefold(),
+    )
 
 
 def values_at_path(record: Any, path: PathTokens) -> Iterator[Any]:
@@ -716,11 +711,19 @@ def main() -> int:
         print(f"Sampled {valid:,} record(s); encountered {invalid:,} invalid item(s).")
         if len(discovered) >= args.max_fields:
             print(f"Warning: field discovery reached --max-fields ({args.max_fields:,}).")
-        try:
-            selected_fields = choose_fields(discovered)
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+        selected_fields = select_fields_by_name(discovered, args.field_name_contains)
+        if not selected_fields:
+            print(
+                f"Error: no discovered field path contains "
+                f"{args.field_name_contains!r} (case-insensitive). Increase "
+                "--sample-per-file or specify one or more --field values.",
+                file=sys.stderr,
+            )
             return 2
+        print(
+            "Automatically selected field(s): "
+            + ", ".join(display_path(path) for path in selected_fields)
+        )
 
     terms = [term for term in (args.terms or []) if term]
     if not terms:
@@ -749,12 +752,6 @@ def main() -> int:
     )
     if args.json_record_path:
         print(f"Nested JSON record array: {args.json_record_path}")
-    if sys.stdin.isatty() and not args.fields:
-        proceed = input("Begin extraction? [Y/n]: ").strip().casefold()
-        if proceed not in ("", "y", "yes"):
-            print("Cancelled.")
-            return 0
-
     temporary_path: Path | None = None
     started = time.monotonic()
     combined = Stats()
@@ -825,4 +822,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
